@@ -1,0 +1,1732 @@
+---
+title: "AML Multi-omic Analysis - Section 2 (TE Volcano: Discovery + Validation)"
+author: "Research Team"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: readable
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5,
+  dpi = 150,
+  dev = "png",
+  fig.retina = 2
+)
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(dplyr)
+  library(tibble)
+  library(ggplot2)
+  library(gridExtra)
+  library(ggrepel)
+})
+```
+
+## 1) Auto-download input files (edit URLs)
+
+Replace the placeholder URLs with your real file links (HTTP/HTTPS).  
+If you already have files locally, set `download_inputs <- FALSE`.
+
+```{r download-inputs}
+download_inputs <- TRUE
+
+# ---- Put your real URLs here ----
+url_gene_c1 <- "BEAT_BM_c1_gene_counts.txt"
+url_gene_c2 <- "BEAT_BM_c2_gene_counts.txt"
+url_te_rda  <- "BEAT_BM_TE_subfamily_counts.Rda"
+url_meta_c1 <- "aml_baseline_clinical_beats_BM_c1_cyto.csv"
+url_meta_c2 <- "aml_baseline_clinical_beats_BM_c2_cyto.csv"
+
+# ---- Local filenames (saved into ./data) ----
+dir.create("data", showWarnings = FALSE, recursive = TRUE)
+
+path_gene_c1 <- "BEAT_BM_c1_gene_counts.txt"
+path_gene_c2 <- "BEAT_BM_c2_gene_counts.txt"
+path_te_rda  <- "BEAT_BM_TE_subfamily_counts.Rda"
+path_meta_c1 <- "aml_baseline_clinical_beats_BM_c1_cyto.csv"
+path_meta_c2 <- "aml_baseline_clinical_beats_BM_c2_cyto.csv"
+
+dl <- function(url, dest) {
+  if (is.na(url) || url == "" || grepl("YOUR_LINK", url)) {
+    stop("Please replace placeholder URLs (YOUR_LINK) with real links before running.")
+  }
+  if (!file.exists(dest)) {
+    message("Downloading: ", basename(dest))
+    utils::download.file(url, destfile = dest, mode = "wb", quiet = TRUE)
+  } else {
+    message("Found local file: ", dest)
+  }
+}
+
+if (isTRUE(download_inputs)) {
+  dl(url_gene_c1, path_gene_c1)
+  dl(url_gene_c2, path_gene_c2)
+  dl(url_te_rda,  path_te_rda)
+  dl(url_meta_c1, path_meta_c1)
+  dl(url_meta_c2, path_meta_c2)
+}
+
+stopifnot(file.exists(path_gene_c1), file.exists(path_gene_c2),
+          file.exists(path_te_rda),  file.exists(path_meta_c1),
+          file.exists(path_meta_c2))
+```
+
+## 2) Configuration
+
+```{r config}
+target_cols <- c(
+  "dbgap_rnaseq_sample", "response_induction", "sex", "age_dx",
+  "npm1", "runx1", "asxl1", "tp53", "DNMT3A", "IDH1", "IDH2",
+  "KRAS", "NRAS", "PTPN11", "spliceosome", "cohesin", "ras_pathway",
+  "cyto_t_8_21", "cyto_inv16", "cyto_cbf", "cyto_t_15_17",
+  "cyto_inv3", "cyto_t_6_9", "cyto_5_7_abn", "cyto_plus8",
+  "cyto_normal", "eln_clean"
+)
+```
+
+## 3) Load TE counts from `.Rda`
+
+```{r load-te}
+te_env <- new.env()
+load(path_te_rda, envir = te_env)
+
+te_obj_name <- ls(te_env)[sapply(ls(te_env), function(x)
+  is.matrix(get(x, te_env)) || is.data.frame(get(x, te_env))
+)][1]
+
+if (is.na(te_obj_name) || length(te_obj_name) == 0) {
+  stop("No matrix/data.frame object found inside the TE .Rda file.")
+}
+
+te_df <- as.data.frame(get(te_obj_name, envir = te_env), check.names = FALSE)
+
+if (!("TE_subfamily" %in% colnames(te_df))) {
+  stop("Expected a column named 'TE_subfamily' in TE object.")
+}
+
+te_mat <- as.matrix(as.data.frame(lapply(
+  te_df[, colnames(te_df) != "TE_subfamily", drop = FALSE],
+  function(x) as.numeric(trimws(as.character(x)))
+)))
+
+rownames(te_mat) <- paste0("TEF_", te_df$TE_subfamily)
+
+message("TE matrix dims: ", nrow(te_mat), " x ", ncol(te_mat))
+```
+
+## 4) Helper functions
+
+```{r helpers}
+prep_meta <- function(path_meta, target_cols) {
+  read.csv(path_meta) %>%
+    filter(response_induction %in% c("Complete Response", "Refractory")) %>%
+    select(all_of(target_cols)) %>%
+    mutate(
+      response_induction = factor(gsub(" ", "_", response_induction),
+                                  levels = c("Complete_Response", "Refractory")),
+      sex = factor(sex)
+    ) %>%
+    column_to_rownames("dbgap_rnaseq_sample")
+}
+
+run_deseq <- function(gene_counts_path, meta_df, te_mat) {
+  gene <- read.delim(gene_counts_path, header = TRUE, row.names = 1, check.names = FALSE)
+
+  common <- base::intersect(base::intersect(colnames(gene), colnames(te_mat)), rownames(meta_df))
+  if (length(common) < 5) stop("Too few overlapping samples after intersect(). Check sample IDs.")
+
+  counts <- rbind(gene[, common, drop = FALSE], te_mat[, common, drop = FALSE])
+
+  dds <- DESeqDataSetFromMatrix(
+    countData = round(counts),
+    colData   = meta_df[common, , drop = FALSE],
+    design    = ~ sex + age_dx + response_induction
+  )
+
+  dds <- DESeq(dds, quiet = TRUE)
+  res <- results(dds, contrast = c("response_induction", "Refractory", "Complete_Response"))
+  list(dds = dds, res = res, common = common)
+}
+
+prep_te_res <- function(res) {
+  as.data.frame(res) %>%
+    rownames_to_column("feature") %>%
+    filter(grepl("TEF_LTR|TEF_LINE|TEF_SINE", feature)) %>%
+    mutate(
+      te_class = case_when(
+        grepl("LTR", feature)  ~ "LTR",
+        grepl("LINE", feature) ~ "LINE",
+        grepl("SINE", feature) ~ "SINE",
+        TRUE ~ "Other"
+      ),
+      feature = gsub("TEF_", "", feature),
+      status = case_when(
+        !is.na(pvalue) & pvalue < 0.01 & log2FoldChange > 0 ~ "Upregulated",
+        !is.na(pvalue) & pvalue < 0.01 & log2FoldChange < 0 ~ "Downregulated",
+        TRUE ~ "NS"
+      ),
+      neglog10p = ifelse(is.na(pvalue), NA_real_, -log10(pvalue))
+    )
+}
+
+volcano_plot <- function(df,
+                         title,
+                         lfc_thr_label = 0.5,
+                         p_thr_label   = 0.01,
+                         max_labels    = 30,
+                         drop_class_prefix = TRUE,
+                         y_lim = c(-0.1, 6)) {
+
+  stopifnot(all(c("pvalue","log2FoldChange","neglog10p","status","feature") %in% colnames(df)))
+
+  plot_df <- df %>%
+    dplyr::mutate(
+      feature_clean = if (drop_class_prefix) sub("^[^:]+:", "", feature) else feature,
+      label_me = !is.na(pvalue) & pvalue < p_thr_label & log2FoldChange > lfc_thr_label
+    )
+
+  label_df <- plot_df %>%
+    dplyr::filter(label_me) %>%
+    dplyr::arrange(dplyr::desc(neglog10p)) %>%
+    dplyr::slice_head(n = max_labels)
+
+  ggplot2::ggplot(plot_df, ggplot2::aes(x = log2FoldChange, y = neglog10p)) +
+    ggplot2::geom_point(ggplot2::aes(color = status),
+                        alpha = 0.75, size = 1.8, na.rm = TRUE) +
+    ggrepel::geom_text_repel(
+      data = label_df,
+      ggplot2::aes(label = feature_clean),
+      size = 3.0,
+      fontface = "bold",
+      max.overlaps = Inf,
+      box.padding = 0.30,
+      point.padding = 0.20,
+      min.segment.length = 0,
+      segment.size = 0.25
+    ) +
+    ggplot2::geom_vline(
+      xintercept = c(-lfc_thr_label, lfc_thr_label),
+      linetype = "dashed", linewidth = 0.35
+    ) +
+    ggplot2::geom_hline(
+      yintercept = -log10(p_thr_label),
+      linetype = "dashed", linewidth = 0.35
+    ) +
+    ggplot2::scale_color_manual(
+      values = c("Upregulated" = "#D55E00",
+                 "Downregulated" = "#0072B2",
+                 "NS" = "grey70"),
+      name = NULL
+    ) +
+    ggplot2::labs(
+      title = title,
+      subtitle = paste0(
+        "Labels: upregulated (log2FC>", lfc_thr_label,
+        ", p<", p_thr_label, "); top ", max_labels, " by -log10(p)"
+      ),
+      x = "log2(Fold Change)",
+      y = "-log10(p-value)"
+    ) +
+    ggplot2::theme_classic(base_size = 12) +
+    ggplot2::theme(
+      legend.position = "top",
+      plot.title = ggplot2::element_text(face = "bold", size = 14),
+      plot.subtitle = ggplot2::element_text(face = "bold", size = 10),
+      axis.title = ggplot2::element_text(face = "bold", size = 12),
+      axis.text  = ggplot2::element_text(face = "bold", size = 10),
+      axis.line  = ggplot2::element_line(linewidth = 0.6),
+      axis.ticks = ggplot2::element_line(linewidth = 0.6),
+      panel.grid = ggplot2::element_blank()
+    ) +
+    ggplot2::coord_cartesian(ylim = y_lim)
+}
+
+```
+
+## 5) Discovery cohort (c1)
+
+```{r discovery}
+meta_c1 <- prep_meta(path_meta_c1, target_cols)
+fit_c1  <- run_deseq(path_gene_c1, meta_c1, te_mat)
+res_te_c1 <- prep_te_res(fit_c1$res)
+
+if (nrow(res_te_c1) == 0) stop("No TE rows found in Discovery cohort after filtering!")
+
+p_c1 <- volcano_plot(res_te_c1, "Discovery (Wave 1+2)")
+print(p_c1)
+```
+
+## 6) Validation cohort (c2)
+
+```{r validation}
+meta_c2 <- prep_meta(path_meta_c2, target_cols)
+fit_c2  <- run_deseq(path_gene_c2, meta_c2, te_mat)
+res_te_c2 <- prep_te_res(fit_c2$res)
+
+p_c2 <- volcano_plot(res_te_c2, "Validation (Wave 3+4)")
+print(p_c2)
+```
+
+## 7) Side-by-side comparison
+
+```{r combined, fig.width=12, fig.height=5}
+gridExtra::grid.arrange(p_c1, p_c2, ncol = 2)
+```
+
+## 8) Save outputs (tables + plots)
+
+```{r save-outputs}
+dir.create("outputs", showWarnings = FALSE, recursive = TRUE)
+
+write.csv(res_te_c1, file.path("outputs", "TE_results_discovery_c1.csv"), row.names = FALSE)
+write.csv(res_te_c2, file.path("outputs", "TE_results_validation_c2.csv"), row.names = FALSE)
+
+ggsave(file.path("outputs", "volcano_discovery_c1.png"), plot = p_c1, width = 8, height = 5, dpi = 200)
+ggsave(file.path("outputs", "volcano_validation_c2.png"), plot = p_c2, width = 8, height = 5, dpi = 200)
+
+message("Saved outputs to: ./outputs")
+```
+
+
+```{r pies-and-venn-upregulated-families, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(forcats)
+  library(VennDiagram)
+  library(grid)
+})
+
+# -----------------------------
+# Settings
+# -----------------------------
+p_thr   <- 0.01
+lfc_thr <- 0
+
+families_keep <- c(
+  "LTR:ERV1","LTR:ERVL","LTR:ERVL-MaLR","LTR:ERVK",
+  "SINE:RTE-X","LINE:L1","LINE:CR1","SINE:Alu","SINE:MIR"
+)
+
+# -----------------------------
+# Helper: parse feature -> Family_ID + Subfamily key
+# Assumes feature looks like "LTR:ERVK:XYZ" (or similar).
+# If your feature format is different, tell me and I’ll adapt the parser.
+# -----------------------------
+prep_up <- function(res_te, cohort_name) {
+  res_te %>%
+    mutate(
+      Cohort = cohort_name,
+      TE = feature
+    ) %>%
+    separate(TE, into = c("Class","Family","Subfamily"), sep=":",
+             remove = FALSE, fill = "right", extra = "merge") %>%
+    mutate(
+      Class = coalesce(Class, "Other"),
+      Family = coalesce(Family, "Other"),
+      Subfamily = coalesce(Subfamily, TE),
+      Family_ID = paste(Class, Family, sep=":"),
+      # unique key for overlap testing
+      SubKey = paste(Class, Family, Subfamily, sep=":")
+    ) %>%
+    filter(!is.na(pvalue), !is.na(log2FoldChange)) %>%
+    filter(pvalue < p_thr, log2FoldChange > lfc_thr) %>%
+    filter(Family_ID %in% families_keep)
+}
+
+up_c1 <- prep_up(res_te_c1, "Discovery (c1)")
+up_c2 <- prep_up(res_te_c2, "Validation (c2)")
+
+# -----------------------------
+# PIE CHARTS: Contribution by Family_ID
+# -----------------------------
+pie_df <- bind_rows(up_c1, up_c2) %>%
+  count(Cohort, Family_ID, name = "n_up") %>%
+  group_by(Cohort) %>%
+  mutate(
+    pct = 100 * n_up / sum(n_up),
+    Family_ID = factor(Family_ID, levels = families_keep)
+  ) %>%
+  ungroup()
+
+pie_plot <- function(cohort_name) {
+  d <- pie_df %>% filter(Cohort == cohort_name) %>% arrange(desc(pct))
+  if (nrow(d) == 0) {
+    return(ggplot() + theme_void() +
+             labs(title = paste0("Upregulated contribution: ", cohort_name),
+                  subtitle = "No upregulated subfamilies passed filters in selected families"))
+  }
+
+  ggplot(d, aes(x = "", y = n_up, fill = Family_ID)) +
+    geom_col(width = 1, colour = "white") +
+    coord_polar(theta = "y") +
+    theme_void() +
+    labs(
+      title = paste0("Upregulated TE subfamilies by family: ", cohort_name),
+      subtitle = paste0("p < ", p_thr, ", log2FC > ", lfc_thr),
+      fill = "Family"
+    ) +
+    geom_text(
+      aes(label = sprintf("%.1f%%", pct)),
+      position = position_stack(vjust = 0.5),
+      size = 3,
+      fontface = "bold"
+    ) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(face = "bold", size = 10),
+      legend.title = element_text(face = "bold"),
+      legend.text = element_text(face = "bold")
+    )
+}
+
+p_pie_c1 <- pie_plot("Discovery (c1)")
+p_pie_c2 <- pie_plot("Validation (c2)")
+# 
+# print(p_pie_c1)
+# print(p_pie_c2)
+
+# Save pies
+dir.create("outputs", showWarnings = FALSE, recursive = TRUE)
+ggsave("outputs/Pie_upregulated_family_contribution_Discovery.png", p_pie_c1, width = 7, height = 6, dpi = 200)
+ggsave("outputs/Pie_upregulated_family_contribution_Validation.png", p_pie_c2, width = 7, height = 6, dpi = 200)
+
+# -----------------------------
+# VENN: overlap of upregulated subfamilies (SubKey)
+# -----------------------------
+set_c1 <- unique(up_c1$SubKey)
+set_c2 <- unique(up_c2$SubKey)
+
+venn_obj <- VennDiagram::venn.diagram(
+  x = list(`Discovery (c1)` = set_c1, `Validation (c2)` = set_c2),
+  filename = NULL,   # draw to R device
+  fill = c("#56B4E9", "#E69F00"),
+  alpha = 0.5,
+  cex = 1.3,
+  cat.cex = 1.1,
+  cat.fontface = "bold",
+  fontface = "bold",
+  margin = 0.1
+)
+
+grid::grid.newpage()
+grid::grid.draw(venn_obj)
+
+# Save Venn as PNG
+png("outputs/Venn_upregulated_subfamilies_Discovery_vs_Validation.png", width = 900, height = 700, res = 150)
+grid::grid.newpage()
+grid::grid.draw(venn_obj)
+dev.off()
+
+# Also print counts to console/table
+overlap_n <- length(intersect(set_c1, set_c2))
+only_c1   <- length(setdiff(set_c1, set_c2))
+only_c2   <- length(setdiff(set_c2, set_c1))
+
+cat("\nUpregulated overlap counts (within selected families):\n")
+cat("Discovery only:", only_c1, "\n")
+cat("Validation only:", only_c2, "\n")
+cat("Shared:", overlap_n, "\n")
+```
+
+
+
+
+
+
+```{r shared-upregulated-lfc-and-vst-boxplots, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(forcats)
+})
+
+# -----------------------------
+# Settings
+# -----------------------------
+p_thr   <- 0.01
+lfc_thr <- 0
+max_shared_to_plot <- 9
+
+families_keep <- c(
+  "LTR:ERV1","LTR:ERVL","LTR:ERVL-MaLR","LTR:ERVK",
+  "SINE:RTE-X","LINE:L1","LINE:CR1","SINE:Alu","SINE:MIR"
+)
+
+# -----------------------------
+# Helper: upregulated TE set with stable key
+# (No need for dds objects here)
+# -----------------------------
+prep_up_set <- function(res_te, cohort_name) {
+  res_te %>%
+    dplyr::mutate(Cohort = cohort_name, TE = feature) %>%
+    tidyr::separate(
+      TE, into = c("Class","Family","Subfamily"),
+      sep=":", remove = FALSE, fill="right", extra="merge"
+    ) %>%
+    dplyr::mutate(
+      Class     = dplyr::coalesce(Class, "Other"),
+      Family    = dplyr::coalesce(Family, "Other"),
+      Subfamily = dplyr::coalesce(Subfamily, TE),
+      Family_ID = paste(Class, Family, sep=":"),
+      SubKey    = paste(Class, Family, Subfamily, sep=":")
+    ) %>%
+    dplyr::filter(
+      !is.na(pvalue), !is.na(log2FoldChange),
+      pvalue < p_thr, log2FoldChange > lfc_thr,
+      Family_ID %in% families_keep
+    )
+}
+
+up_c1 <- prep_up_set(res_te_c1, "Discovery (c1)")
+up_c2 <- prep_up_set(res_te_c2, "Validation (c2)")
+
+shared_keys <- intersect(unique(up_c1$SubKey), unique(up_c2$SubKey))
+
+if (length(shared_keys) == 0) {
+  cat("No shared upregulated TE subfamilies between Discovery and Validation at p<",
+      p_thr, " and log2FC>", lfc_thr, " within selected families.\n", sep="")
+} else {
+
+  # -----------------------------
+  # 1) Bar chart: log2FC Discovery vs Validation for shared
+  # -----------------------------
+  lfc_c1 <- up_c1 %>%
+    dplyr::filter(SubKey %in% shared_keys) %>%
+    dplyr::select(SubKey, Class, Family, Subfamily, log2FoldChange) %>%
+    dplyr::rename(log2FC_Discovery = log2FoldChange)
+
+  lfc_c2 <- up_c2 %>%
+    dplyr::filter(SubKey %in% shared_keys) %>%
+    dplyr::select(SubKey, log2FoldChange) %>%
+    dplyr::rename(log2FC_Validation = log2FoldChange)
+
+  shared_lfc <- lfc_c1 %>%
+    dplyr::inner_join(lfc_c2, by = "SubKey") %>%
+    dplyr::mutate(mean_log2FC = (log2FC_Discovery + log2FC_Validation) / 2) %>%
+    dplyr::arrange(dplyr::desc(mean_log2FC)) %>%
+    dplyr::slice_head(n = max_shared_to_plot)
+
+  shared_lfc_long <- shared_lfc %>%
+    tidyr::pivot_longer(
+      cols = c(log2FC_Discovery, log2FC_Validation),
+      names_to = "Cohort",
+      values_to = "log2FC"
+    ) %>%
+    dplyr::mutate(
+      Cohort = dplyr::recode(Cohort,
+                             log2FC_Discovery = "Discovery (c1)",
+                             log2FC_Validation = "Validation (c2)"),
+      SubLabel = paste0(Class, ":", Family, ":", Subfamily),
+      SubLabel = factor(SubLabel, levels = unique(SubLabel))
+    )
+
+  p_lfc <- ggplot(shared_lfc_long, aes(x = SubLabel, y = log2FC, fill = Cohort)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+    geom_hline(yintercept = 0, linewidth = 0.4) +
+    labs(
+      title = "Shared upregulated TE subfamilies: log2FC (Discovery vs Validation)",
+      subtitle = paste0("p<", p_thr, ", log2FC>", lfc_thr,
+                        " | top ", min(max_shared_to_plot, nrow(shared_lfc)), " by mean log2FC"),
+      x = "TE subfamily",
+      y = "log2(Fold Change)"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 60, hjust = 1, face = "bold", size = 9),
+      axis.text.y = element_text(face = "bold"),
+      axis.title = element_text(face = "bold"),
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(face = "bold"),
+      legend.position = "top",
+      legend.title = element_blank()
+    )
+
+  # print(p_lfc)
+
+  dir.create("outputs", showWarnings = FALSE, recursive = TRUE)
+  ggsave("outputs/Shared_upregulated_log2FC_Discovery_vs_Validation.png",
+         p_lfc, width = 13, height = 6, dpi = 200)
+
+  # -----------------------------
+  # 2) Boxplots: VST expression by response (FAST)
+  # Requires dds_c1 / dds_c2. If not present, we skip boxplots gracefully.
+  # -----------------------------
+  if (!exists("dds_c1") || !exists("dds_c2")) {
+    cat("dds_c1/dds_c2 not found in this Rmd run, so skipping VST boxplots.\\n",
+        "Run the DESeq2 sections that create dds_c1 and dds_c2 before this chunk.\\n", sep="")
+  } else {
+
+    shared_top_keys <- shared_lfc$SubKey
+    te_rows <- paste0("TEF_", shared_top_keys)
+
+    vsd_c1 <- DESeq2::vst(dds_c1, blind = TRUE)
+    vsd_c2 <- DESeq2::vst(dds_c2, blind = TRUE)
+
+    get_box_df <- function(vsd, cohort_name, te_rows_keep) {
+      mat <- SummarizedExperiment::assay(vsd)
+      present <- intersect(rownames(mat), te_rows_keep)
+      if (length(present) == 0) return(NULL)
+
+      expr <- mat[present, , drop = FALSE] %>%
+        as.data.frame() %>%
+        tibble::rownames_to_column("Feature")
+
+      long <- expr %>%
+        tidyr::pivot_longer(-Feature, names_to = "Sample", values_to = "VST") %>%
+        dplyr::mutate(SubKey = sub("^TEF_", "", Feature), Cohort = cohort_name)
+
+      meta <- as.data.frame(SummarizedExperiment::colData(vsd)) %>%
+        tibble::rownames_to_column("Sample")
+
+      long %>%
+        dplyr::left_join(meta, by = "Sample") %>%
+        dplyr::filter(!is.na(response_induction)) %>%
+        dplyr::mutate(
+          response_induction = factor(response_induction,
+                                       levels = c("Complete_Response", "Refractory")),
+          TE_label = factor(SubKey, levels = shared_top_keys)
+        )
+    }
+
+    box_df <- dplyr::bind_rows(
+      get_box_df(vsd_c1, "Discovery (c1)", te_rows),
+      get_box_df(vsd_c2, "Validation (c2)", te_rows)
+    )
+
+    if (is.null(box_df) || nrow(box_df) == 0) {
+      cat("Could not extract VST expression for shared TE rows from dds objects.\\n")
+    } else {
+
+      p_box <- ggplot(box_df, aes(x = response_induction, y = VST, fill = response_induction)) +
+        geom_boxplot(outlier.size = 0.6, width = 0.7) +
+        facet_grid(TE_label ~ Cohort, scales = "free_y") +
+        labs(
+          title = "Shared upregulated TE subfamilies: expression by response",
+          subtitle = "VST expression | Complete Response vs Refractory",
+          x = NULL,
+          y = "VST expression"
+        ) +
+        theme_classic(base_size = 12) +
+        theme(
+          strip.text = element_text(face = "bold", size = 9),
+          axis.text.x = element_text(face = "bold", angle = 20, hjust = 1),
+          axis.text.y = element_text(face = "bold"),
+          axis.title = element_text(face = "bold"),
+          plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(face = "bold"),
+          legend.position = "none"
+        )
+
+      # print(p_box)
+
+      ggsave(
+        "outputs/Shared_upregulated_VST_boxplots_Response_byCohort.png",
+        p_box,
+        width = 12,
+        height = max(6, 0.35 * length(unique(box_df$TE_label)) + 3),
+        dpi = 200
+      )
+    }
+  }
+}
+
+
+```
+
+
+```{r shared-upregulated-vst-boxplots-force-new, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(forcats)
+})
+
+# -----------------------------
+# Settings
+# -----------------------------
+p_thr   <- 0.01
+lfc_thr <- 0
+max_shared_to_plot <- 9
+
+families_keep <- c(
+  "LTR:ERV1","LTR:ERVL","LTR:ERVL-MaLR","LTR:ERVK",
+  "SINE:RTE-X","LINE:L1","LINE:CR1","SINE:Alu","SINE:MIR"
+)
+
+# -----------------------------
+# Shared upregulated TE subfamilies (keys)
+# -----------------------------
+prep_up_set <- function(res_te, cohort_name) {
+  res_te %>%
+    mutate(Cohort = cohort_name, TE = feature) %>%
+    separate(TE, into = c("Class","Family","Subfamily"), sep=":",
+             remove = FALSE, fill="right", extra="merge") %>%
+    mutate(
+      Class     = coalesce(Class, "Other"),
+      Family    = coalesce(Family, "Other"),
+      Subfamily = coalesce(Subfamily, TE),
+      Family_ID = paste(Class, Family, sep=":"),
+      SubKey    = paste(Class, Family, Subfamily, sep=":")
+    ) %>%
+    filter(!is.na(pvalue), !is.na(log2FoldChange),
+           pvalue < p_thr, log2FoldChange > lfc_thr,
+           Family_ID %in% families_keep)
+}
+
+up_c1 <- prep_up_set(res_te_c1, "Discovery (c1)")
+up_c2 <- prep_up_set(res_te_c2, "Validation (c2)")
+
+shared_keys <- intersect(unique(up_c1$SubKey), unique(up_c2$SubKey))
+if (length(shared_keys) == 0) {
+  stop("No shared upregulated TE subfamilies found with current thresholds.")
+}
+
+# Use the top shared by mean log2FC for readability (same as before)
+lfc_c1 <- up_c1 %>% filter(SubKey %in% shared_keys) %>%
+  select(SubKey, log2FoldChange) %>% rename(fc1 = log2FoldChange)
+lfc_c2 <- up_c2 %>% filter(SubKey %in% shared_keys) %>%
+  select(SubKey, log2FoldChange) %>% rename(fc2 = log2FoldChange)
+
+shared_top_keys <- lfc_c1 %>%
+  inner_join(lfc_c2, by = "SubKey") %>%
+  mutate(mean_fc = (fc1 + fc2)/2) %>%
+  arrange(desc(mean_fc)) %>%
+  slice_head(n = max_shared_to_plot) %>%
+  pull(SubKey)
+
+te_rows <- paste0("TEF_", shared_top_keys)
+
+# -----------------------------
+# Build counts + metadata if missing (so VST ALWAYS works)
+# Requires: path_gene_c1/path_gene_c2/path_te_rda and the meta csv paths
+# -----------------------------
+if (!exists("te_mat")) {
+  te_env <- new.env()
+  load(path_te_rda, envir = te_env)
+  te_obj_name <- ls(te_env)[sapply(ls(te_env), function(x)
+    is.matrix(get(x, te_env)) || is.data.frame(get(x, te_env))
+  )][1]
+  te_df <- as.data.frame(get(te_obj_name, envir = te_env), check.names = FALSE)
+  te_mat <- as.matrix(as.data.frame(lapply(
+    te_df[, colnames(te_df) != "TE_subfamily", drop = FALSE],
+    function(x) as.numeric(trimws(as.character(x)))
+  )))
+  rownames(te_mat) <- paste0("TEF_", te_df$TE_subfamily)
+}
+
+if (!exists("counts_c1") || !exists("meta_c1")) {
+  gene_c1_tmp <- read.delim(path_gene_c1, header = TRUE, row.names = 1, check.names = FALSE)
+  meta_c1 <- read.csv(path_meta_c1) %>%
+    filter(response_induction %in% c("Complete Response", "Refractory")) %>%
+    select(all_of(target_cols)) %>%
+    mutate(response_induction = factor(gsub(" ", "_", response_induction),
+                                       levels = c("Complete_Response", "Refractory")),
+           sex = factor(sex)) %>%
+    column_to_rownames("dbgap_rnaseq_sample")
+
+  common_c1 <- intersect(intersect(colnames(gene_c1_tmp), colnames(te_mat)), rownames(meta_c1))
+  counts_c1 <- rbind(gene_c1_tmp[, common_c1, drop = FALSE], te_mat[, common_c1, drop = FALSE])
+  meta_c1 <- meta_c1[common_c1, , drop = FALSE]
+}
+
+if (!exists("counts_c2") || !exists("meta_c2")) {
+  gene_c2_tmp <- read.delim(path_gene_c2, header = TRUE, row.names = 1, check.names = FALSE)
+  meta_c2 <- read.csv(path_meta_c2) %>%
+    filter(response_induction %in% c("Complete Response", "Refractory")) %>%
+    select(all_of(target_cols)) %>%
+    mutate(response_induction = factor(gsub(" ", "_", response_induction),
+                                       levels = c("Complete_Response", "Refractory")),
+           sex = factor(sex)) %>%
+    column_to_rownames("dbgap_rnaseq_sample")
+
+  common_c2 <- intersect(intersect(colnames(gene_c2_tmp), colnames(te_mat)), rownames(meta_c2))
+  counts_c2 <- rbind(gene_c2_tmp[, common_c2, drop = FALSE], te_mat[, common_c2, drop = FALSE])
+  meta_c2 <- meta_c2[common_c2, , drop = FALSE]
+}
+
+# -----------------------------
+# VST and boxplots (TEs only)
+# -----------------------------
+dds1 <- DESeqDataSetFromMatrix(round(counts_c1), meta_c1, design = ~ response_induction)
+dds2 <- DESeqDataSetFromMatrix(round(counts_c2), meta_c2, design = ~ response_induction)
+
+vsd1 <- varianceStabilizingTransformation(dds1, blind = TRUE)
+vsd2 <- varianceStabilizingTransformation(dds2, blind = TRUE)
+
+to_long <- function(vsd, cohort_name) {
+  mat <- SummarizedExperiment::assay(vsd)
+  present <- intersect(rownames(mat), te_rows)
+  if (length(present) == 0) return(NULL)
+
+  df <- mat[present, , drop = FALSE] %>%
+    as.data.frame() %>%
+    rownames_to_column("Feature") %>%
+    pivot_longer(-Feature, names_to = "Sample", values_to = "VST") %>%
+    mutate(
+      SubKey = sub("^TEF_", "", Feature),
+      Cohort = cohort_name
+    )
+
+  meta <- as.data.frame(SummarizedExperiment::colData(vsd)) %>%
+    rownames_to_column("Sample")
+
+  df %>%
+    left_join(meta, by = "Sample") %>%
+    mutate(
+      response_induction = factor(response_induction,
+                                  levels = c("Complete_Response", "Refractory")),
+      TE_label = factor(SubKey, levels = shared_top_keys)
+    )
+}
+
+box_df <- bind_rows(
+  to_long(vsd1, "Discovery (c1)"),
+  to_long(vsd2, "Validation (c2)")
+)
+
+if (is.null(box_df) || nrow(box_df) == 0) {
+  stop("Boxplot data is empty: TE rows not found in VST matrices. Check TE feature naming (TEF_ prefix + Class:Family:Subfamily).")
+}
+
+p_box <- ggplot(box_df, aes(x = response_induction, y = VST, fill = response_induction)) +
+  geom_boxplot(outlier.size = 0.6, width = 0.7) +
+  facet_grid(TE_label ~ Cohort, scales = "free_y") +
+  labs(
+    title = "Shared upregulated TE subfamilies: expression by response",
+    subtitle = "VST expression | Complete Response vs Refractory",
+    x = NULL,
+    y = "VST expression"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold", size = 9),
+    axis.text.x = element_text(face = "bold", angle = 20, hjust = 1),
+    axis.text.y = element_text(face = "bold"),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+# print(p_box)
+
+dir.create("outputs", showWarnings = FALSE, recursive = TRUE)
+ggsave("outputs/Shared_upregulated_VST_boxplots_Response_byCohort.png",
+       p_box, width = 12,
+       height = max(6, 0.35 * length(unique(box_df$TE_label)) + 3),
+       dpi = 200)
+```
+
+```{r top_shared_upregulated_VST_jitter_pub, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(SummarizedExperiment)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(forcats)
+  library(ggbeeswarm)
+  library(rstatix)
+})
+
+# -----------------------------
+# Settings
+# -----------------------------
+p_thr   <- 0.01
+lfc_thr <- 0
+top_n   <- 9
+
+families_keep <- c(
+  "LTR:ERV1","LTR:ERVL","LTR:ERVL-MaLR","LTR:ERVK",
+  "SINE:RTE-X","LINE:L1","LINE:CR1","SINE:Alu","SINE:MIR"
+)
+
+# -----------------------------
+# Helper: align counts and metadata (fixes DESeq2 ncol vs nrow errors)
+# -----------------------------
+align_counts_meta <- function(counts, meta, cohort = "Cohort") {
+  counts <- as.matrix(counts)
+  meta   <- as.data.frame(meta)
+
+  # If meta has Sample column but rownames are not set, set them
+  if (is.null(rownames(meta)) || any(rownames(meta) == "")) {
+    if ("Sample" %in% colnames(meta)) rownames(meta) <- meta$Sample
+    if ("sample" %in% colnames(meta)) rownames(meta) <- meta$sample
+  }
+
+  if (is.null(colnames(counts)) || any(colnames(counts) == "")) {
+    stop(cohort, ": counts has missing/empty column names (sample IDs).")
+  }
+  if (is.null(rownames(meta)) || any(rownames(meta) == "")) {
+    stop(cohort, ": meta has missing/empty rownames. Provide rownames(meta)=sample IDs or a Sample column.")
+  }
+
+  clean_id <- function(x) gsub("[[:space:]]+", "_", trimws(as.character(x)))
+  colnames(counts) <- clean_id(colnames(counts))
+  rownames(meta)   <- clean_id(rownames(meta))
+
+  common <- intersect(colnames(counts), rownames(meta))
+  if (length(common) == 0) {
+    stop(cohort, ": no matching sample IDs between counts colnames and meta rownames.\n",
+         "Example counts: ", paste(head(colnames(counts), 5), collapse=", "), "\n",
+         "Example meta:   ", paste(head(rownames(meta), 5), collapse=", "))
+  }
+
+  if (length(common) < ncol(counts) || length(common) < nrow(meta)) {
+    message(cohort, ": aligning on ", length(common), " shared samples (dropping non-shared).")
+  }
+
+  counts2 <- counts[, common, drop = FALSE]
+  meta2   <- meta[common, , drop = FALSE]
+  stopifnot(identical(colnames(counts2), rownames(meta2)))
+
+  storage.mode(counts2) <- "integer"
+  list(counts = counts2, meta = meta2)
+}
+
+# -----------------------------
+# 0) Required objects check
+# -----------------------------
+need_objs <- c("res_te_c1","res_te_c2","counts_c1","meta_c1","counts_c2","meta_c2")
+missing <- need_objs[!sapply(need_objs, exists)]
+if (length(missing) > 0) {
+  stop("Missing objects needed for this chunk: ", paste(missing, collapse = ", "),
+       ".\nMake sure earlier chunks create these objects.")
+}
+
+# -----------------------------
+# 1) Find TOP N shared upregulated subfamilies (Discovery ∩ Validation)
+# -----------------------------
+prep_up_set <- function(res_te, cohort_name) {
+  res_te %>%
+    mutate(Cohort = cohort_name, TE = feature) %>%
+    separate(TE, into = c("Class","Family","Subfamily"), sep=":",
+             remove = FALSE, fill="right", extra="merge") %>%
+    mutate(
+      Class     = coalesce(Class, "Other"),
+      Family    = coalesce(Family, "Other"),
+      Subfamily = coalesce(Subfamily, TE),
+      Family_ID = paste(Class, Family, sep=":"),
+      SubKey    = paste(Class, Family, Subfamily, sep=":")
+    ) %>%
+    filter(!is.na(pvalue), !is.na(log2FoldChange),
+           pvalue < p_thr, log2FoldChange > lfc_thr,
+           Family_ID %in% families_keep)
+}
+
+up_c1 <- prep_up_set(res_te_c1, "Discovery")
+up_c2 <- prep_up_set(res_te_c2, "Validation")
+
+shared_keys <- intersect(unique(up_c1$SubKey), unique(up_c2$SubKey))
+if (length(shared_keys) == 0) stop("No shared upregulated subfamilies under current thresholds.")
+
+top_keys <- up_c1 %>%
+  filter(SubKey %in% shared_keys) %>%
+  select(SubKey, log2FoldChange) %>%
+  rename(fc1 = log2FoldChange) %>%
+  inner_join(
+    up_c2 %>%
+      filter(SubKey %in% shared_keys) %>%
+      select(SubKey, log2FoldChange) %>%
+      rename(fc2 = log2FoldChange),
+    by = "SubKey"
+  ) %>%
+  mutate(mean_fc = (fc1 + fc2) / 2) %>%
+  arrange(desc(mean_fc)) %>%
+  slice_head(n = top_n) %>%
+  pull(SubKey)
+
+te_rows <- paste0("TEF_", top_keys)
+
+# -----------------------------
+# 2) VST expression for TE rows (FAST, no DESeq run)
+# -----------------------------
+a1 <- align_counts_meta(counts_c1, meta_c1, cohort = "Discovery")
+a2 <- align_counts_meta(counts_c2, meta_c2, cohort = "Validation")
+
+dds1 <- DESeqDataSetFromMatrix(a1$counts, a1$meta, design = ~ response_induction)
+dds2 <- DESeqDataSetFromMatrix(a2$counts, a2$meta, design = ~ response_induction)
+
+vsd1 <- varianceStabilizingTransformation(dds1, blind = TRUE)
+vsd2 <- varianceStabilizingTransformation(dds2, blind = TRUE)
+
+to_long <- function(vsd, cohort_name) {
+  mat <- SummarizedExperiment::assay(vsd)
+  present <- intersect(rownames(mat), te_rows)
+  if (length(present) == 0) {
+    stop("None of the selected TE rows found in ", cohort_name,
+         " VST matrix. Check TE rownames. Example rownames: ",
+         paste(head(rownames(mat), 5), collapse = ", "))
+  }
+
+  df <- mat[present, , drop = FALSE] %>%
+    as.data.frame() %>%
+    rownames_to_column("Feature") %>%
+    pivot_longer(-Feature, names_to = "Sample", values_to = "expr") %>%
+    mutate(
+      SubKey  = sub("^TEF_", "", Feature),
+      Cohort  = cohort_name
+    )
+
+  meta <- as.data.frame(SummarizedExperiment::colData(vsd)) %>%
+    rownames_to_column("Sample")
+
+  df %>%
+    left_join(meta, by = "Sample") %>%
+    filter(response_induction %in% c("Complete_Response","Refractory")) %>%
+    mutate(
+      response_induction = factor(response_induction,
+                                  levels = c("Complete_Response","Refractory"))
+    )
+}
+
+plot_df <- bind_rows(
+  to_long(vsd1, "Discovery"),
+  to_long(vsd2, "Validation")
+) %>%
+  mutate(
+    SubKey = factor(SubKey, levels = top_keys),
+    Cohort = factor(Cohort, levels = c("Discovery","Validation"))
+  )
+
+# -----------------------------
+# 3) Stats (Wilcoxon) + BH-FDR per cohort; y-position guaranteed
+# -----------------------------
+stats_df2 <- plot_df %>%
+  group_by(Cohort, SubKey) %>%
+  rstatix::wilcox_test(expr ~ response_induction) %>%
+  ungroup() %>%
+  group_by(Cohort) %>%
+  rstatix::adjust_pvalue(method = "BH") %>%
+  ungroup() %>%
+  left_join(
+    plot_df %>%
+      group_by(Cohort, SubKey) %>%
+      summarise(y = max(expr, na.rm = TRUE) + 0.15, .groups = "drop"),
+    by = c("Cohort","SubKey")
+  ) %>%
+  mutate(
+    p_lab = paste0("p=", signif(p, 2), "\nFDR=", signif(p.adj, 2)),
+    x = "Refractory"
+  )
+
+# Strong median bars (explicit segments)
+med_df <- plot_df %>%
+  group_by(Cohort, SubKey, response_induction) %>%
+  summarise(med = median(expr, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    x_num = as.numeric(factor(response_induction,
+                              levels = levels(plot_df$response_induction))),
+    x0 = x_num - 0.22,
+    x1 = x_num + 0.22
+  )
+
+# -----------------------------
+# 4) Publication-style jitter + median bars + p-values
+# -----------------------------
+# -----------------------------
+# Clean publication jitter (properly centered median)
+# -----------------------------
+
+# ---- medians computed explicitly (robust) ----
+med_df <- plot_df %>%
+  group_by(Cohort, SubKey, response_induction) %>%
+  summarise(med = median(expr, na.rm = TRUE), .groups = "drop")
+
+dodge_w <- 0.65
+
+p_jitter <- ggplot(
+  plot_df,
+  aes(x = SubKey, y = expr, color = response_induction)
+) +
+  # jitter / beeswarm (triangles, smaller)
+  ggbeeswarm::geom_quasirandom(
+    aes(group = response_induction),
+    dodge.width = dodge_w,
+    width = 0.12,
+    alpha = 0.80,
+    size = 0.85,
+    shape = 17
+  ) +
+
+  # median “bar” as a horizontal tick (always visible + centered)
+  geom_point(
+    data = med_df,
+    aes(x = SubKey, y = med, group = response_induction),
+    inherit.aes = FALSE,
+    position = position_dodge(width = dodge_w),
+    shape = 95,          # horizontal line tick
+    size = 7.5,          # length of the tick
+    stroke = 0.15,       # thickness of the tick
+    color = "black"
+  ) +
+
+  # p-values on top of each pair (one per SubKey x Cohort)
+  geom_text(
+    data = stats_df2,
+    aes(x = SubKey, y = y, label = p_lab),
+    inherit.aes = FALSE,
+    size = 2.6,
+    fontface = "bold",
+    color = "black",
+    vjust = 0
+  ) +
+
+  facet_grid(Cohort ~ ., scales = "free_y") +
+
+  scale_color_manual(
+    values = c("Complete_Response" = "#0072B2",
+               "Refractory"        = "#D55E00"),
+    name = "Response",
+    labels = c("Complete response", "Refractory")
+  ) +
+
+  labs(
+    title = "Top shared upregulated TE subfamilies",
+    subtitle = "VST expression | triangles = samples | median in black | Wilcoxon p-value",
+    x = "TE subfamily",
+    y = "VST expression"
+  ) +
+
+  coord_cartesian(ylim = c(0, 15), clip = "off") +
+
+  theme_classic(base_size = 10) +
+  theme(
+    strip.text = element_text(face = "bold", size = 8),
+    plot.title = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(face = "bold", size = 9),
+    axis.title = element_text(face = "bold", size = 10),
+    axis.text.x = element_text(face = "bold", size = 7, angle = 35, hjust = 1),
+    axis.text.y = element_text(face = "bold", size = 7),
+    axis.line  = element_line(linewidth = 0.6),
+    axis.ticks = element_line(linewidth = 0.6),
+    legend.title = element_text(face = "bold", size = 9),
+    legend.text  = element_text(size = 8)
+  )
+
+# print(p_jitter)
+
+
+
+
+
+
+# -----------------------------
+# 4) Publication-style jitter + median ticks + significance stars (top of panel)
+# -----------------------------
+
+# -----------------------------
+# Drop Class prefix (SINE/LINE/LTR) + medians + stars + plot
+# -----------------------------
+
+# 0) Clean SubKey labels for plotting (drop the first field before ":")
+plot_df <- plot_df %>%
+  mutate(
+    SubKey_clean = sub("^[^:]+:", "", as.character(SubKey))
+  )
+
+# keep the original ordering (so panels stay in your intended top_keys order)
+clean_levels <- sub("^[^:]+:", "", as.character(top_keys))
+plot_df$SubKey_clean <- factor(plot_df$SubKey_clean, levels = clean_levels)
+
+# 1) Medians per cohort x subfamily x response
+med_df <- plot_df %>%
+  group_by(Cohort, SubKey_clean, response_induction) %>%
+  summarise(med = median(expr, na.rm = TRUE), .groups = "drop")
+
+# 2) Significance stars per cohort x subfamily (uses stats_df2 with columns Cohort, SubKey, p)
+stats_star <- stats_df2 %>%
+  mutate(
+    SubKey_clean = sub("^[^:]+:", "", as.character(SubKey)),
+    stars = dplyr::case_when(
+      p <= 0.0001 ~ "****",
+      p <= 0.001  ~ "***",
+      p <= 0.01   ~ "**",
+      p <= 0.05   ~ "*",
+      TRUE        ~ ""
+    ),
+    y = 14.2  # top of panel if using ylim 0–15
+  )
+
+# 3) Plot
+dodge_w <- 0.65
+
+p_jitter <- ggplot(
+  plot_df,
+  aes(x = SubKey_clean, y = expr, color = response_induction)
+) +
+  ggbeeswarm::geom_quasirandom(
+    aes(group = response_induction),
+    dodge.width = dodge_w,
+    width = 0.12,
+    alpha = 0.80,
+    size = 0.75,
+    shape = 17
+  ) +
+  # median tick
+  geom_point(
+    data = med_df,
+    aes(x = SubKey_clean, y = med, group = response_induction),
+    inherit.aes = FALSE,
+    position = position_dodge(width = dodge_w),
+    shape = 95,
+    size = 6.0,     # tick length
+    stroke = 0.35,  # tick thickness
+    color = "black"
+  ) +
+  # stars at top
+  geom_text(
+    data = stats_star,
+    aes(x = SubKey_clean, y = y, label = stars),
+    inherit.aes = FALSE,
+    size = 4.0,
+    fontface = "bold",
+    color = "black",
+    vjust = 0
+  ) +
+  facet_grid(Cohort ~ ., scales = "free_y") +
+  scale_color_manual(
+    values = c("Complete_Response" = "#0072B2",
+               "Refractory"        = "#D55E00"),
+    name = "Response",
+    labels = c("Complete response", "Refractory")
+  ) +
+  labs(
+    title = "Top shared upregulated TE subfamilies",
+    subtitle = "VST expression | triangles = samples | median in black | Wilcoxon significance",
+    x = "TE subfamily",
+    y = "VST expression"
+  ) +
+  coord_cartesian(ylim = c(0, 15), clip = "off") +
+  theme_classic(base_size = 10) +
+  theme(
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold", size = 8),
+    plot.title = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(face = "bold", size = 9),
+    axis.title = element_text(face = "bold", size = 10),
+    axis.text.x = element_text(face = "bold", size = 7, angle = 35, hjust = 1),
+    axis.text.y = element_text(face = "bold", size = 7),
+    axis.line  = element_line(linewidth = 0.6),
+    axis.ticks = element_line(linewidth = 0.6),
+    legend.title = element_text(face = "bold", size = 9),
+    legend.text  = element_text(size = 8)
+  )
+
+# print(p_jitter)
+
+
+
+
+
+
+```
+
+
+```{r top_shared_upregulated_VST_jitter_pub_new, message=FALSE, warning=FALSE, fig.width=6}
+print(p_jitter)
+
+```
+## 9) Gene set enrichment analysis (GSEA): Hallmark and REACTOME
+
+This section runs **pre-ranked GSEA** on the *gene* results (excluding TE features) for both cohorts, using MSigDB **Hallmark** and **C2:CP:REACTOME** gene sets.
+
+```{r gsea-hallmark-reactome, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(ggplot2)
+  library(msigdbr)
+  library(fgsea)
+})
+
+dir.create("outputs/gsea", showWarnings = FALSE, recursive = TRUE)
+
+# ---- sanity checks ----
+if (!exists("fit_c1") || !exists("fit_c2")) {
+  stop("GSEA chunk needs fit_c1 and fit_c2 (from the Discovery/Validation DESeq2 chunks). ",
+       "Please run the Discovery and Validation sections first.")
+}
+
+# ---- helper: extract gene-only DESeq2 result table ----
+get_gene_res <- function(res) {
+  df <- as.data.frame(res) %>% tibble::rownames_to_column("feature")
+  df %>%
+    filter(!grepl("^TEF_", feature)) %>%          # drop TE rows
+    filter(!is.na(stat))                          # fgsea needs numeric ranks
+}
+
+# ---- helper: build rank vector (named) ----
+# We rank by DESeq2 'stat' (Wald statistic): standard for pre-ranked GSEA
+make_ranks <- function(gene_df) {
+  ranks <- gene_df$stat
+  names(ranks) <- gene_df$feature
+  ranks <- ranks[is.finite(ranks)]
+  ranks <- sort(ranks, decreasing = TRUE)
+  ranks
+}
+
+# ---- optional: map Ensembl IDs -> HGNC symbols if needed ----
+maybe_map_ensembl_to_symbol <- function(ranks) {
+  # heuristic: Ensembl IDs often start with ENSG
+  if (!any(grepl("^ENSG", names(ranks)))) return(ranks)
+
+  if (!requireNamespace("AnnotationDbi", quietly = TRUE) ||
+      !requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+    stop("Your gene IDs look like Ensembl (ENSG...), but packages org.Hs.eg.db and AnnotationDbi ",
+         "are not installed. Install them or provide gene symbols in the count matrix rownames.")
+  }
+
+  key <- sub("\\..*$", "", names(ranks))  # strip version suffix if present
+  map <- AnnotationDbi::select(org.Hs.eg.db::org.Hs.eg.db,
+                               keys = unique(key),
+                               keytype = "ENSEMBL",
+                               columns = c("SYMBOL"))
+  map <- map %>%
+    filter(!is.na(SYMBOL), SYMBOL != "") %>%
+    distinct(ENSEMBL, SYMBOL)
+
+  # aggregate duplicate symbols by max |stat|
+  tmp <- tibble(ENSEMBL = key, stat = as.numeric(ranks)) %>%
+    left_join(map, by = "ENSEMBL") %>%
+    filter(!is.na(SYMBOL)) %>%
+    group_by(SYMBOL) %>%
+    summarise(stat = stat[which.max(abs(stat))], .groups = "drop")
+
+  out <- tmp$stat
+  names(out) <- tmp$SYMBOL
+  out <- sort(out, decreasing = TRUE)
+  out
+}
+
+# ---- MSigDB gene sets ----
+msig_h <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  select(gs_name, gene_symbol) %>%
+  distinct()
+
+msig_react <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME") %>%
+  select(gs_name, gene_symbol) %>%
+  distinct()
+
+# ---- run fgsea for one cohort ----
+run_fgsea <- function(ranks, pathways_df, label, minSize = 15, maxSize = 500) {
+  pathways <- split(pathways_df$gene_symbol, pathways_df$gs_name)
+  fgsea::fgseaMultilevel(
+    pathways = pathways,
+    stats = ranks,
+    minSize = minSize,
+    maxSize = maxSize,
+    eps = 0.0
+  ) %>%
+    as_tibble() %>%
+    arrange(padj, desc(abs(NES))) %>%
+    mutate(Cohort = label)
+}
+
+# ---- build ranks for each cohort ----
+gene_c1 <- get_gene_res(fit_c1$res)
+gene_c2 <- get_gene_res(fit_c2$res)
+
+ranks_c1 <- make_ranks(gene_c1) %>% maybe_map_ensembl_to_symbol()
+ranks_c2 <- make_ranks(gene_c2) %>% maybe_map_ensembl_to_symbol()
+
+# ---- GSEA: Hallmark ----
+gsea_h_c1 <- run_fgsea(ranks_c1, msig_h, "Discovery")
+gsea_h_c2 <- run_fgsea(ranks_c2, msig_h, "Validation")
+
+gsea_h_all <- bind_rows(gsea_h_c1, gsea_h_c2)
+
+# write.csv(gsea_h_all, "outputs/gsea/GSEA_Hallmark_Discovery_Validation.csv", row.names = FALSE)
+
+# ---- GSEA: REACTOME ----
+gsea_r_c1 <- run_fgsea(ranks_c1, msig_react, "Discovery")
+gsea_r_c2 <- run_fgsea(ranks_c2, msig_react, "Validation")
+
+gsea_r_all <- bind_rows(gsea_r_c1, gsea_r_c2)
+
+# write.csv(gsea_r_all, "outputs/gsea/GSEA_REACTOME_Discovery_Validation.csv", row.names = FALSE)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+})
+
+# ------------------------------------------------------------
+# Dotplot helper (works for fgsea outputs: requires column 'pathway')
+# Expects gsea_df has at least: pathway, NES, padj, Cohort
+# ------------------------------------------------------------
+plot_gsea_dot <- function(gsea_df, title, top_n = 15) {
+
+  req <- c("pathway", "NES", "padj", "Cohort")
+  miss <- setdiff(req, colnames(gsea_df))
+  if (length(miss) > 0) {
+    stop("plot_gsea_dot(): gsea_df is missing columns: ", paste(miss, collapse = ", "))
+  }
+
+  df_plot <- gsea_df %>%
+    filter(!is.na(padj), is.finite(NES)) %>%
+    group_by(Cohort) %>%
+    arrange(padj, .by_group = TRUE) %>%
+    slice_head(n = top_n) %>%
+    ungroup() %>%
+    mutate(
+      gs_name = pathway,
+      gs_name = gsub("^HALLMARK_", "", gs_name),
+      gs_name = gsub("^REACTOME_", "", gs_name),
+      gs_name = gsub("_", " ", gs_name),
+      neglog10padj = -log10(padj)
+    )
+
+  ggplot(df_plot, aes(x = NES, y = reorder(gs_name, NES))) +
+    geom_point(aes(size = neglog10padj, color = NES), alpha = 0.85) +
+    facet_grid(Cohort ~ ., scales = "free_y") +
+    scale_color_gradient2(low = "#0072B2", mid = "white", high = "#D55E00", midpoint = 0) +
+    labs(
+      title = title,
+      x = "Normalized Enrichment Score (NES)",
+      y = NULL,
+      size = "-log10(adj p)",
+      color = "NES"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      strip.text = element_text(face = "bold"),
+      plot.title = element_text(face = "bold"),
+      axis.text  = element_text(face = "bold", size = 10),
+      axis.title = element_text(face = "bold")
+    )
+}
+
+# ------------------------------------------------------------
+# Safety checks: you should already have these from the GSEA chunk
+# ------------------------------------------------------------
+need_objs <- c("gsea_h_all", "gsea_r_all")
+missing <- need_objs[!sapply(need_objs, exists)]
+if (length(missing) > 0) {
+  stop("Missing objects: ", paste(missing, collapse = ", "),
+       ".\nRun the GSEA computation chunk first (fgsea results binding).")
+}
+
+# ------------------------------------------------------------
+# Hallmark dotplot
+# ------------------------------------------------------------
+p_h <- plot_gsea_dot(gsea_h_all, "GSEA (Hallmark): Discovery vs Validation", top_n = 15)
+# print(p_h)
+
+# ------------------------------------------------------------
+# REACTOME dotplot
+# ------------------------------------------------------------
+p_r <- plot_gsea_dot(gsea_r_all, "GSEA (REACTOME): Discovery vs Validation", top_n = 15)
+# print(p_r)
+
+# ------------------------------------------------------------
+# Save
+# ------------------------------------------------------------
+dir.create("outputs/gsea", showWarnings = FALSE, recursive = TRUE)
+ggsave("outputs/gsea/GSEA_Hallmark_dotplot.png", p_h, width = 8.5, height = 7.5, dpi = 300)
+ggsave("outputs/gsea/GSEA_REACTOME_dotplot.png", p_r, width = 8.5, height = 7.5, dpi = 300)
+
+```
+
+
+```{r gsea_hallmark_dotplots_split, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+})
+
+# ------------------------------------------------------------
+# Dotplot helper (Hallmark only). Expects fgsea output columns:
+# pathway, NES, padj, Cohort  (Cohort = "Discovery" / "Validation")
+# ------------------------------------------------------------
+plot_gsea_hallmark_dot <- function(gsea_df, cohort_name, top_n = 15) {
+
+  req <- c("pathway","NES","padj","Cohort")
+  miss <- setdiff(req, colnames(gsea_df))
+  if (length(miss) > 0) {
+    stop("plot_gsea_hallmark_dot(): gsea_df is missing columns: ", paste(miss, collapse = ", "))
+  }
+
+  df_plot <- gsea_df %>%
+    filter(Cohort == cohort_name, !is.na(padj), is.finite(NES)) %>%
+    arrange(padj) %>%
+    slice_head(n = top_n) %>%
+    mutate(
+      gs_name = gsub("^HALLMARK_", "", pathway),
+      gs_name = gsub("_", " ", gs_name),
+      neglog10padj = -log10(padj)
+    )
+
+  ggplot(df_plot, aes(x = NES, y = reorder(gs_name, NES))) +
+    geom_point(aes(size = neglog10padj, color = NES), alpha = 0.85) +
+    scale_color_gradient2(low = "#0072B2", mid = "white", high = "#D55E00", midpoint = 0) +
+    labs(
+      title = paste0("GSEA (Hallmark): ", cohort_name),
+      subtitle = paste0("Top ", top_n, " pathways by adjusted p-value"),
+      x = "Normalized Enrichment Score (NES)",
+      y = NULL,
+      size = "-log10(adj p)",
+      color = "NES"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(face = "bold", size = 10),
+      axis.text  = element_text(face = "bold", size = 10),
+      axis.title = element_text(face = "bold")
+    )
+}
+
+# ------------------------------------------------------------
+# Safety check: object from your GSEA computation chunk
+# ------------------------------------------------------------
+if (!exists("gsea_h_all")) {
+  stop("Object 'gsea_h_all' not found. Run the Hallmark GSEA computation chunk first.")
+}
+
+# Optional: if Cohort column is missing but you have separate objects, stop clearly
+if (!("Cohort" %in% colnames(gsea_h_all))) {
+  stop("'gsea_h_all' must contain a column named 'Cohort' with values 'Discovery'/'Validation'.")
+}
+
+# ------------------------------------------------------------
+# Make separate plots
+# ------------------------------------------------------------
+p_h_disc <- plot_gsea_hallmark_dot(gsea_h_all, cohort_name = "Discovery",  top_n = 15)
+p_h_val  <- plot_gsea_hallmark_dot(gsea_h_all, cohort_name = "Validation", top_n = 15)
+
+# print(p_h_disc)
+# print(p_h_val)
+
+# ------------------------------------------------------------
+# Save
+# ------------------------------------------------------------
+dir.create("outputs/gsea", showWarnings = FALSE, recursive = TRUE)
+ggsave("outputs/gsea/GSEA_Hallmark_dotplot_Discovery.png",  p_h_disc, width = 8.5, height = 7.5, dpi = 300)
+ggsave("outputs/gsea/GSEA_Hallmark_dotplot_Validation.png", p_h_val,  width = 8.5, height = 7.5, dpi = 300)
+```
+
+
+```{r gsea_hallmark_combined_deseq2, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(dplyr)
+  library(tibble)
+  library(msigdbr)
+  library(fgsea)
+  library(ggplot2)
+})
+
+# ------------------------------------------------------------
+# 0) Required inputs
+#   - counts_c1, meta_c1 : Discovery
+#   - counts_c2, meta_c2 : Validation
+#   - meta must contain: response_induction with levels Complete_Response/Refractory
+# ------------------------------------------------------------
+need_objs <- c("counts_c1","meta_c1","counts_c2","meta_c2")
+missing <- need_objs[!sapply(need_objs, exists)]
+if (length(missing) > 0) {
+  stop("Missing objects: ", paste(missing, collapse = ", "),
+       ". Make sure earlier chunks create counts_c1/meta_c1 and counts_c2/meta_c2.")
+}
+
+# ------------------------------------------------------------
+# Helper: align counts/meta and standardize sample IDs
+# ------------------------------------------------------------
+align_counts_meta <- function(counts, meta, cohort = "Cohort") {
+  counts <- as.matrix(counts)
+  meta   <- as.data.frame(meta)
+
+  if (is.null(rownames(meta)) || any(rownames(meta) == "")) {
+    if ("Sample" %in% colnames(meta)) rownames(meta) <- meta$Sample
+    if ("sample" %in% colnames(meta)) rownames(meta) <- meta$sample
+  }
+
+  if (is.null(colnames(counts)) || any(colnames(counts) == "")) {
+    stop(cohort, ": counts has missing/empty column names (sample IDs).")
+  }
+  if (is.null(rownames(meta)) || any(rownames(meta) == "")) {
+    stop(cohort, ": meta has missing/empty rownames. Provide rownames(meta)=sample IDs or a Sample column.")
+  }
+
+  clean_id <- function(x) gsub("[[:space:]]+", "_", trimws(as.character(x)))
+  colnames(counts) <- clean_id(colnames(counts))
+  rownames(meta)   <- clean_id(rownames(meta))
+
+  common <- intersect(colnames(counts), rownames(meta))
+  if (length(common) == 0) {
+    stop(cohort, ": no matching sample IDs between counts colnames and meta rownames.\n",
+         "Example counts: ", paste(head(colnames(counts), 5), collapse=", "), "\n",
+         "Example meta:   ", paste(head(rownames(meta), 5), collapse=", "))
+  }
+
+  counts2 <- counts[, common, drop = FALSE]
+  meta2   <- meta[common, , drop = FALSE]
+  stopifnot(identical(colnames(counts2), rownames(meta2)))
+
+  storage.mode(counts2) <- "integer"
+  list(counts = counts2, meta = meta2)
+}
+
+# ------------------------------------------------------------
+# 1) Align each cohort, add Cohort column, then combine
+# ------------------------------------------------------------
+a1 <- align_counts_meta(counts_c1, meta_c1, cohort = "Discovery")
+a2 <- align_counts_meta(counts_c2, meta_c2, cohort = "Validation")
+
+meta1 <- a1$meta %>% mutate(Cohort = "Discovery")
+meta2 <- a2$meta %>% mutate(Cohort = "Validation")
+
+# Ensure response_induction exists
+if (!("response_induction" %in% colnames(meta1)) || !("response_induction" %in% colnames(meta2))) {
+  stop("meta_c1/meta_c2 must contain column 'response_induction'.")
+}
+
+# Combine counts by columns (samples). Row order must match.
+common_rows <- intersect(rownames(a1$counts), rownames(a2$counts))
+if (length(common_rows) == 0) stop("No shared features between counts_c1 and counts_c2 rownames.")
+counts1 <- a1$counts[common_rows, , drop = FALSE]
+counts2 <- a2$counts[common_rows, , drop = FALSE]
+
+counts_all <- cbind(counts1, counts2)
+meta_all   <- bind_rows(meta1, meta2)
+stopifnot(identical(colnames(counts_all), rownames(meta_all)))
+
+# Standardize factor levels
+meta_all <- meta_all %>%
+  mutate(
+    Cohort = factor(Cohort, levels = c("Discovery","Validation")),
+    response_induction = factor(response_induction,
+                                levels = c("Complete_Response","Refractory"))
+  )
+
+# ------------------------------------------------------------
+# 2) DESeq2 on combined cohort (controls for Cohort)
+#    Main contrast: Refractory vs Complete_Response
+# ------------------------------------------------------------
+dds_all <- DESeqDataSetFromMatrix(
+  countData = counts_all,
+  colData   = meta_all,
+  design    = ~ sex + age_dx + response_induction
+)
+
+# Optional: remove low-count features for speed/stability
+keep <- rowSums(counts(dds_all)) >= 10
+dds_all <- dds_all[keep, ]
+
+dds_all <- DESeq(dds_all, quiet = TRUE)
+
+res_all <- results(dds_all, contrast = c("response_induction","Refractory","Complete_Response"))
+res_all <- as.data.frame(res_all) %>%
+  rownames_to_column("feature") %>%
+  mutate(stat = as.numeric(stat))
+
+# ------------------------------------------------------------
+# 3) Build ranked list for GSEA (DESeq2 stat)
+#    Remove TE features if they are prefixed as TEF_
+# ------------------------------------------------------------
+rank_df <- res_all %>%
+  filter(!is.na(stat), is.finite(stat)) %>%
+  filter(!grepl("^TEF_", feature))  # keep genes only
+
+ranks <- rank_df$stat
+names(ranks) <- rank_df$feature
+ranks <- sort(ranks, decreasing = TRUE)
+
+# ------------------------------------------------------------
+# 4) Hallmark pathways (MSigDB) + fgsea
+# ------------------------------------------------------------
+msig_h <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  select(gs_name, gene_symbol)
+
+pathways_h <- split(msig_h$gene_symbol, msig_h$gs_name)
+
+set.seed(1)
+gsea_h_combined <- fgsea::fgseaMultilevel(
+  pathways = pathways_h,
+  stats    = ranks,
+  minSize  = 15,
+  maxSize  = 500
+) %>%
+  as_tibble() %>%
+  arrange(padj) %>%
+  mutate(
+    gs_clean = gsub("^HALLMARK_", "", pathway),
+    gs_clean = gsub("_", " ", gs_clean),
+    neglog10padj = -log10(padj)
+  )
+
+# Save table
+dir.create("outputs/gsea", showWarnings = FALSE, recursive = TRUE)
+# write.csv(gsea_h_combined, "outputs/gsea/GSEA_Hallmark_CombinedCohorts.csv", row.names = FALSE)
+
+# ------------------------------------------------------------
+# 5) Simple dotplot for combined GSEA (top 20)
+# ------------------------------------------------------------
+top_n <- 20
+gsea_plot_df <- gsea_h_combined %>%
+  filter(!is.na(padj)) %>%
+  slice_head(n = top_n)
+
+p_h_combined <- ggplot(gsea_plot_df,
+                       aes(x = NES, y = reorder(gs_clean, NES))) +
+  geom_point(aes(size = neglog10padj, color = NES), alpha = 0.85) +
+  scale_color_gradient2(low = "#0072B2", mid = "white", high = "#D55E00", midpoint = 0) +
+  labs(
+    title = "GSEA Hallmark Refractory vs CR",
+    subtitle = "DESeq2: ~ Cohort + response_induction (Refractory vs Complete_Response)",
+    x = "Normalized Enrichment Score (NES)",
+    y = NULL,
+    size = "-log10(adj p)",
+    color = "NES"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "bold", size = 10),
+    axis.text  = element_text(face = "bold", size = 10),
+    axis.title = element_text(face = "bold")
+  )
+
+ggsave("outputs/gsea/GSEA_Hallmark_CombinedCohorts_dotplot.png",
+       p_h_combined, width = 8.5, height = 7.5, dpi = 300)
+```
+
+```{r gsea_hallmark_combined_deseq2_new, message=FALSE, warning=FALSE, fig.width=6.5 }
+print(p_h_combined)
+
+```
+
+
+
+### How to run
+
+1. Save this file as `Section2_TE_volcano.Rmd` (already provided for you here)
+2. Edit the 5 URLs in **“Auto-download input files”**
+3. Knit to HTML (RStudio: **Knit**), or run:
+
+```r
+rmarkdown::render("Section2_TE_volcano.Rmd", output_format = "html_document")
+```
