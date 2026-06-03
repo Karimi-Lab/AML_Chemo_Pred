@@ -1,5 +1,6 @@
-# Transposable Element Expression as a Molecular Linker of Transcriptomic States Associated with Induction Failure in Acute Myeloid Leukemia
- Scripts and data used in our paper titled "Transposable Element Expression as a Molecular Linker of Transcriptomic States Associated with Induction Failure in Acute Myeloid Leukemia"
+# Integrative Multi-Layer Modeling Identifies an Endogenous Retrovirus Signature of Induction Failure in AML
+
+ Scripts and data used in our paper titled "Integrative Multi-Layer Modeling Identifies an Endogenous Retrovirus Signature of Induction Failure in AML"
 
 <br/>
 
