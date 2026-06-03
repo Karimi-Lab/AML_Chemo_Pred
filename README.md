@@ -15,7 +15,7 @@ Nested gradient-boosted decision tree models were implemented to evaluate increm
 [|_Figure 1](https://github.com/Karimi-Lab/AML_Chemo_Pred/tree/main/Original_submission/Figure1): Data and scripts used to produce Figure 1 <br/>
 [|_Figure 2](https://github.com/Karimi-Lab/AML_Chemo_Pred/tree/main/Original_submission/Figure2): Data and scripts used to produce Figure 2 <br/>
 [|_Modelling](https://github.com/Karimi-Lab/AML_Chemo_Pred/tree/main/Original_submission/Modelling): Data and scripts used in the XGBoost models <br/>
-[Revision](https://github.com/Karimi-Lab/AML_Chemo_Pred/tree/main/Revision): Data and scripts used in the original submission <br/>
+[Revision](https://github.com/Karimi-Lab/AML_Chemo_Pred/tree/main/Revision): Data and scripts used in the Revision <br/>
 [|_Revised_Figure2](https://github.com/Karimi-Lab/AML_Chemo_Pred/tree/main/Revision/Revised_figure2): Data and scripts used to produce Figure 2 in the revision <br/>
 [|_Supplementary_Figure_1](https://github.com/Karimi-Lab/AML_Chemo_Pred/tree/main/Revision/Supplementary_Figure_1): Data and scripts used to produce Supp. Figure 1 in the revision <br/>
 [|_Supplementary_Figure_2](https://github.com/Karimi-Lab/AML_Chemo_Pred/tree/main/Revision/Supplementary_Figure_2): Data and scripts used to produce Supp. Figure 2 in the revision <br/>
