@@ -1,0 +1,144 @@
+---
+title: "AML Induction Response: Model Performance Analysis"
+output: html_document
+---
+
+```{r figure_1_row_plots, echo=FALSE, warning=FALSE, message=FALSE, fig.width=7}
+library(tidyverse)
+library(tidymodels)
+library(gridExtra)
+library(grid)
+
+# 1. SETTINGS & NATURE THEME
+nature_cols <- c("Model 1 (Clin + Gen)" = "#4477AA", 
+                 "Model 2 (+Transcripts)" = "#EE6677", 
+                 "Model 3 (+RTEs)" = "#228833")
+
+theme_nature <- function() {
+  theme_classic(base_size = 11) %+replace%
+    theme(
+      axis.line = element_line(linewidth = 0.5, color = "black"),
+      axis.ticks = element_line(linewidth = 0.5, color = "black"),
+      axis.text = element_text(color = "black", family = "sans"),
+      axis.title = element_text(face = "bold", size = 12),
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold"),
+      plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+      panel.background = element_rect(fill = "white", color = NA)
+    )
+}
+
+# 2. DATA LOADING
+# Using readr:: prefix to avoid the 'col_factor' conflict with the scales package
+metrics_df <- readr::read_csv("Models_metrics_related_to_Figure1.csv")
+
+pred_col_spec <- readr::cols(
+  dbgap_rnaseq_sample = readr::col_character(),
+  resp_bin = readr::col_factor(levels = c("CR", "Refractory")),
+  prob_Refractory = readr::col_double()
+)
+
+# Load raw predictions
+preds_m1 <- readr::read_csv("predictions_Model1.csv", col_types = pred_col_spec) %>% 
+  dplyr::mutate(Model = "Model 1 (Clin + Gen)")
+preds_m2 <- readr::read_csv("predictions_Model2.csv", col_types = pred_col_spec) %>% 
+  dplyr::mutate(Model = "Model 2 (+Transcripts)")
+preds_m3 <- readr::read_csv("predictions_Model3.csv", col_types = pred_col_spec) %>% 
+  dplyr::mutate(Model = "Model 3 (+RTEs)")
+
+all_preds <- dplyr::bind_rows(preds_m1, preds_m2, preds_m3)
+
+# 3. PERFORMANCE SUMMARY TABLE (Squeezed and Small)
+# Outputting as a clean, small table first
+cat("### Model Performance Summary\n")
+knitr::kable(metrics_df, digits = 3, format = "html", table.attr = "style='width:60%; font-size:12px;'")
+
+# 4. ROC CURVE (Row Plot 1)
+roc_data <- all_preds %>%
+  dplyr::group_by(Model) %>%
+  yardstick::roc_curve(truth = resp_bin, prob_Refractory, event_level = "second")
+
+# p_roc <- ggplot(roc_data, aes(x = 1 - specificity, y = sensitivity, color = Model)) +
+#   geom_abline(lty = 3, color = "grey70") +
+#   geom_path(linewidth = 1.2) +
+#   scale_color_manual(values = nature_cols) +
+#   labs(title = "Receiver Operating Characteristic (ROC) Curves",
+#        x = "1 - Specificity (False Positive Rate)", 
+#        y = "Sensitivity (True Positive Rate)") +
+#   coord_equal() + 
+#   theme_nature()
+
+# 5. PR CURVE (Row Plot 2)
+pr_data <- all_preds %>%
+  dplyr::group_by(Model) %>%
+  yardstick::pr_curve(truth = resp_bin, prob_Refractory, event_level = "second")
+
+# p_pr <- ggplot(pr_data, aes(x = recall, y = precision, color = Model)) +
+#   geom_path(linewidth = 1.2) +
+#   scale_color_manual(values = nature_cols) +
+#   labs(title = "Precision-Recall Curves",
+#        x = "Recall (Sensitivity)", 
+#        y = "Precision") +
+#   theme_nature()
+# 
+# # 6. SEQUENTIAL OUTPUT
+# # Plotting them independently as row plots
+# print(p_roc)
+# print(p_pr)
+```
+
+
+
+```{r figure_1_model_metrics_barplot, echo=FALSE, warning=FALSE, message=FALSE, fig.width=8.5, fig.height=5}
+
+library(scales)
+
+# Wide table format:
+# Metric | Model 1 (Clin + Gen) | Model 2 (+Transcripts) | Model 3 (+RTEs)
+
+metrics_long <- metrics_df %>%
+  dplyr::rename(Metric = 1) %>%
+  tidyr::pivot_longer(
+    cols = -Metric,
+    names_to = "Model",
+    values_to = "Value"
+  ) %>%
+  dplyr::mutate(
+    Metric = factor(Metric, levels = metrics_df[[1]]),
+    Model  = factor(Model, levels = names(nature_cols))
+  )
+
+p_metrics <- ggplot(metrics_long, aes(x = Metric, y = Value, fill = Model)) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width = 0.72,
+    color = "black",
+    linewidth = 0.2
+  ) +
+  geom_text(
+    aes(label = sprintf("%.3f", Value)),
+    position = position_dodge(width = 0.8),
+    vjust = -0.4,
+    size = 3
+  ) +
+  scale_fill_manual(values = nature_cols, drop = FALSE) +
+  scale_y_continuous(
+    limits = c(0, 1.05),
+    labels = scales::label_number(accuracy = 0.01)
+  ) +
+  labs(
+    title = "Model Performance Summary",
+    x = NULL,
+    y = "Metric value"
+  ) +
+  theme_nature() +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    legend.position = "bottom"
+  )
+
+print(p_metrics)
+
+
+
+```

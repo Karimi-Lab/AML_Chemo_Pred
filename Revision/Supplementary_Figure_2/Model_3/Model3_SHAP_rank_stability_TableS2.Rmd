@@ -1,0 +1,293 @@
+---
+title: "Supplementary SHAP Rank Stability Analysis for Model 3"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: false
+    theme: flatly
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  dpi = 600
+)
+
+library(tidyverse)
+library(readxl)
+library(patchwork)
+library(scales)
+library(ggrepel)
+```
+
+# Aim
+
+This supplementary analysis evaluates the robustness of Model 3 SHAP-derived feature importance rankings across repeated model runs using different random seeds and between the BEAT-AML Waves 1--2 training cohort and the temporally independent Waves 3--4 validation cohort.
+
+Cross-validation was used for hyperparameter optimisation rather than biological feature stability assessment. Because individual cross-validation folds contain only subsets of the training cohort, some fold-wise variation in feature rankings is expected. Therefore, to assess the robustness of SHAP-derived interpretations, we evaluated consistency across repeated random seeds and independent cohorts.
+
+# Input files
+
+This analysis uses the following files generated from the Model 3 SHAP robustness workflow:
+
+- `Model3_SHAP_all_seed_rankings.csv`
+- `Model3_SHAP_train_test_overlap.csv`
+- `Model3_SHAP_top20_frequency_by_cohort.csv`
+- `Model3_SHAP_robust_features.csv`
+- `Table_S2.xlsx`, containing the corrected feature-to-biological-layer annotation.
+
+# Load data
+
+```{r load-data}
+all_seed_rankings <- read_csv("Model3_SHAP_all_seed_rankings.csv", show_col_types = FALSE)
+train_test_overlap <- read_csv("Model3_SHAP_train_test_overlap.csv", show_col_types = FALSE)
+top20_frequency <- read_csv("Model3_SHAP_top20_frequency_by_cohort.csv", show_col_types = FALSE)
+robust_features <- read_csv("Model3_SHAP_robust_features.csv", show_col_types = FALSE)
+feature_annotation <- read_excel("Table_S2.xlsx") %>%
+  mutate(across(everything(), as.character))
+
+N_TOP <- 20
+rank_cap <- N_TOP + 1
+```
+
+# Helper functions
+
+The model matrix contains one-hot encoded variables, for example `npm1_TRUE.` or `eln_clean_Favorable`. The function below maps these processed model features back to the corresponding original feature name in Table S2 by exact matching or longest-prefix matching.
+
+```{r helper-functions}
+map_to_original_feature <- function(feature, annotation_features) {
+  annotation_features <- annotation_features[order(nchar(annotation_features), decreasing = TRUE)]
+  exact_match <- annotation_features[feature == annotation_features]
+  if (length(exact_match) > 0) return(exact_match[1])
+  prefix_match <- annotation_features[str_starts(feature, paste0(annotation_features, "_"))]
+  if (length(prefix_match) > 0) return(prefix_match[1])
+  return(NA_character_)
+}
+
+clean_feature_label <- function(x) {
+  x %>%
+    str_replace_all("_TRUE\\.", " mutation") %>%
+    str_replace_all("_FALSE\\.", " wild-type") %>%
+    str_replace_all("_TRUE", " mutation") %>%
+    str_replace_all("_FALSE", " wild-type") %>%
+    str_replace_all("_new$", " new") %>%
+    str_replace_all("_unknown$", " unknown") %>%
+    str_replace_all("eln_clean_", "ELN: ") %>%
+    str_replace_all("_", " ")
+}
+
+layer_colours <- c(
+  "Clinical" = "#4D4D4D",
+  "Genomic" = "#1F78B4",
+  "Transcriptomic" = "#33A02C",
+  "RTE" = "#E31A1C",
+  "Unannotated" = "#BDBDBD"
+)
+
+feature_map <- all_seed_rankings %>%
+  distinct(Feature) %>%
+  mutate(
+    Original_Feature = map_chr(Feature, map_to_original_feature, annotation_features = feature_annotation$Feature_Name)
+  ) %>%
+  left_join(feature_annotation, by = c("Original_Feature" = "Feature_Name")) %>%
+  mutate(
+    Biological_Layer = replace_na(Biological_Layer, "Unannotated"),
+    Subcategory = replace_na(Subcategory, "Unannotated"),
+    Feature_label = clean_feature_label(Feature)
+  )
+
+feature_map %>%
+  count(Biological_Layer, name = "N_model_features")
+```
+
+# Select robust features for visualization
+
+```{r select-features}
+features_to_show <- robust_features %>%
+  arrange(desc(Total_appearances), Mean_rank) %>%
+  slice_head(n = 20) %>%
+  pull(Feature)
+
+plot_rankings <- all_seed_rankings %>%
+  filter(Feature %in% features_to_show) %>%
+  left_join(feature_map, by = "Feature") %>%
+  mutate(
+    Rank_plot = if_else(Rank <= N_TOP, Rank, rank_cap),
+    Stability_score = if_else(Rank <= N_TOP, rank_cap - Rank, 0),
+    Seed = factor(Seed, levels = sort(unique(Seed))),
+    Cohort = factor(Cohort, levels = c("Training", "Test")),
+    Column = paste(Cohort, Seed, sep = "\n")
+  ) %>%
+  group_by(Feature_label) %>%
+  mutate(Median_rank = median(Rank_plot, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(
+    Feature_label = fct_reorder(Feature_label, -Median_rank),
+    Column = factor(Column, levels = unique(Column[order(Cohort, Seed)])),
+    Biological_Layer = factor(Biological_Layer, levels = c("Clinical", "Genomic", "Transcriptomic", "RTE", "Unannotated"))
+  )
+```
+
+# Panel A: SHAP rank stability across random seeds and cohorts
+
+Darker colour indicates greater stability/higher SHAP importance. A feature ranked first receives the highest stability score, whereas features outside the top 20 receive a score of zero.
+
+```{r panel-a, fig.width=8.6, fig.height=6.2}
+p_heatmap <- ggplot(plot_rankings, aes(x = Column, y = Feature_label, fill = Rank_plot)) +
+  geom_tile(color = "white", linewidth = 0.35) +
+  scale_fill_gradient(
+    low = "#08306B",
+    high = "#F7FBFF",
+    limits = c(1, rank_cap),
+    breaks = c(1, 5, 10, 15, 20),
+    labels = c("1", "5", "10", "15", "20"),
+    name = "SHAP rank\n(lower = more important)"
+  ) +
+  facet_grid(Biological_Layer ~ ., scales = "free_y", space = "free_y") +
+  labs(
+    title = "SHAP feature-rank stability across random seeds and cohorts",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_classic(base_size = 9) +
+  theme(
+    plot.title = element_text(face = "bold", size = 10, hjust = 0),
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 7),
+    axis.text.y = element_text(size = 7),
+    strip.background = element_blank(),
+    strip.text.y = element_text(angle = 0, face = "bold", size = 7),
+    legend.position = "right",
+    panel.spacing.y = unit(0.45, "lines")
+  )
+
+p_heatmap
+```
+
+# Panel B: Concordance of average SHAP ranks between training and validation cohorts
+
+```{r panel-b-data}
+rank_concordance <- all_seed_rankings %>%
+  filter(Rank <= N_TOP) %>%
+  group_by(Cohort, Feature) %>%
+  summarise(
+    Mean_rank = mean(Rank),
+    Times_in_top20 = n(),
+    Mean_importance = mean(Importance),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = Cohort,
+    values_from = c(Mean_rank, Times_in_top20, Mean_importance),
+    names_sep = "_"
+  ) %>%
+  filter(!is.na(Mean_rank_Training), !is.na(Mean_rank_Test)) %>%
+  left_join(feature_map, by = "Feature") %>%
+  mutate(
+    Biological_Layer = factor(Biological_Layer, levels = c("Clinical", "Genomic", "Transcriptomic", "RTE", "Unannotated")),
+    Label_feature = if_else(
+      Mean_rank_Training <= 8 | Mean_rank_Test <= 8 | Feature %in% head(features_to_show, 10),
+      Feature_label,
+      NA_character_
+    )
+  )
+
+rank_correlation <- suppressWarnings(
+  cor(rank_concordance$Mean_rank_Training, rank_concordance$Mean_rank_Test, method = "spearman")
+)
+```
+
+```{r panel-b, fig.width=5.2, fig.height=4.7}
+p_scatter <- ggplot(rank_concordance, aes(x = Mean_rank_Training, y = Mean_rank_Test)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", linewidth = 0.35, colour = "grey45") +
+  geom_point(aes(colour = Biological_Layer), size = 2.6, alpha = 0.9) +
+  ggrepel::geom_text_repel(
+    aes(label = Label_feature),
+    size = 2.4,
+    max.overlaps = Inf,
+    min.segment.length = 0,
+    box.padding = 0.25,
+    segment.size = 0.25,
+    na.rm = TRUE
+  ) +
+  scale_colour_manual(values = layer_colours, drop = FALSE) +
+  scale_x_reverse(limits = c(20.5, 0.5), breaks = c(20, 15, 10, 5, 1)) +
+  scale_y_reverse(limits = c(20.5, 0.5), breaks = c(20, 15, 10, 5, 1)) +
+  coord_equal() +
+  labs(
+    title = "Concordance of SHAP rankings between cohorts",
+    subtitle = paste0("Spearman rho = ", round(rank_correlation, 2)),
+    x = "Mean SHAP rank in training cohort",
+    y = "Mean SHAP rank in validation cohort",
+    colour = "Biological layer"
+  ) +
+  theme_classic(base_size = 9) +
+  theme(
+    plot.title = element_text(face = "bold", size = 10, hjust = 0),
+    plot.subtitle = element_text(size = 8, hjust = 0),
+    legend.position = "bottom",
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 7)
+  )
+
+p_scatter
+```
+
+# Panel C: Top-20 overlap between training and validation cohorts across seeds
+
+```{r panel-c, fig.width=5.2, fig.height=3.2}
+p_overlap <- train_test_overlap %>%
+  mutate(Seed = factor(Seed, levels = Seed)) %>%
+  ggplot(aes(x = Seed, y = Percent_Overlap)) +
+  geom_col(width = 0.68, fill = "grey35") +
+  geom_text(aes(label = paste0(Percent_Overlap, "%")), vjust = -0.35, size = 3) +
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 25), expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "Training-validation overlap of top-20 SHAP features",
+    x = "Random seed",
+    y = "Top-20 feature overlap (%)"
+  ) +
+  theme_classic(base_size = 9) +
+  theme(plot.title = element_text(face = "bold", size = 10, hjust = 0))
+
+p_overlap
+```
+
+# Combined supplementary figure
+
+```{r combined-figure, fig.width=12, fig.height=8.5}
+combined_figure <- p_heatmap | (p_scatter / p_overlap)
+combined_figure + plot_annotation(
+  title = "Supplementary Figure X. Robustness of Model 3 SHAP-derived feature rankings",
+  theme = theme(plot.title = element_text(face = "bold", size = 12))
+)
+
+ggsave(
+  "Supplementary_Figure_Model3_SHAP_rank_stability_TableS2.pdf",
+  plot = combined_figure,
+  width = 12,
+  height = 8.5,
+  units = "in",
+  device = cairo_pdf
+)
+
+ggsave(
+  "Supplementary_Figure_Model3_SHAP_rank_stability_TableS2.png",
+  plot = combined_figure,
+  width = 12,
+  height = 8.5,
+  units = "in",
+  dpi = 600
+)
+```
+
+<!-- # Suggested figure legend -->
+
+<!-- **Supplementary Figure X. Robustness of Model 3 SHAP-derived feature rankings across random seeds and independent cohorts.** -->
+<!-- (A) Heatmap showing the rank stability of the top SHAP features across five independent random seeds in the BEAT-AML Waves 1--2 training cohort and Waves 3--4 validation cohort. Darker colours indicate greater stability and higher SHAP importance. Features are annotated by biological layer using the corrected classification in Table S2. -->
+<!-- (B) Concordance of mean SHAP ranks between training and validation cohorts for features appearing in the top 20 in both cohorts. Points are coloured by biological layer. -->
+<!-- (C) Percentage overlap of the top-20 SHAP features between training and validation cohorts across random seeds. -->

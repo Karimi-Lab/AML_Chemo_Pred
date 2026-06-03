@@ -1,0 +1,9 @@
+.metric,.estimator,.estimate
+accuracy,binary,0.6705882352941176
+sens,binary,0
+spec,binary,1
+recall,binary,0
+precision,binary,NA
+f_meas,binary,NA
+roc_auc,binary,0.7941729323308272
+pr_auc,binary,0.5941433137987808

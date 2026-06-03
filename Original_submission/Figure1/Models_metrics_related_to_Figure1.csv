@@ -1,0 +1,7 @@
+Metric,Model 1 (Clin + Gen),Model 2 (+Transcripts),Model 3 (+RTEs)
+ROC AUC,0.793,0.791,0.794
+PR AUC,0.569,0.584,0.594
+Accuracy,0.694,0.753,0.765
+Specificity,0.579,0.684,0.702
+Sensitivity,0.929,0.893,0.893
+Precision,0.52,0.581,0.595

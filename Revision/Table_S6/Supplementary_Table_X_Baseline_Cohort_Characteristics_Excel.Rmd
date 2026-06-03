@@ -1,0 +1,117 @@
+---
+title: "Supplementary Table X"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(gtsummary)
+library(openxlsx)
+```
+
+```{r load-data}
+# Load cohorts
+c1 <- read_csv("BEAT_BM_c1_merged_full_with_TEF.csv", show_col_types = FALSE) %>%
+  mutate(Cohort = "Waves 1–2 (Training)")
+
+c2 <- read_csv("BEAT_BM_c2_merged_full_with_TEF.csv", show_col_types = FALSE) %>%
+  mutate(Cohort = "Waves 3–4 (Validation)")
+
+# Combine cohorts
+df <- bind_rows(c1, c2)
+
+# Keep only patients included in modelling
+df <- df %>%
+  filter(response_induction %in% c("Refractory", "Complete Response"))
+```
+
+```{r prepare-data}
+vars <- c(
+  "age_dx",
+  "sex",
+  "response_induction",
+  "wbc",
+  "blasts_pb",
+  "blasts_bm",
+  "platelet",
+  "hemoglobin",
+  "eln_clean",
+  "npm1",
+  "flt3_itd",
+  "DNMT3A",
+  "IDH1",
+  "IDH2",
+  "runx1",
+  "asxl1",
+  "tp53"
+)
+
+vars <- vars[vars %in% colnames(df)]
+
+baseline_df <- df %>%
+  select(Cohort, all_of(vars)) %>%
+  mutate(
+    across(
+      any_of(c(
+        "sex", "response_induction", "eln_clean",
+        "npm1", "flt3_itd", "DNMT3A", "IDH1", "IDH2",
+        "runx1", "asxl1", "tp53"
+      )),
+      as.factor
+    )
+  )
+```
+
+```{r generate-table}
+tbl1 <- baseline_df %>%
+  tbl_summary(
+    by = Cohort,
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}-{p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "no",
+    label = list(
+      age_dx ~ "Age at diagnosis",
+      sex ~ "Sex",
+      response_induction ~ "Induction response",
+      wbc ~ "White blood cell count",
+      blasts_pb ~ "Peripheral blood blasts (%)",
+      blasts_bm ~ "Bone marrow blasts (%)",
+      platelet ~ "Platelet count",
+      hemoglobin ~ "Haemoglobin",
+      eln_clean ~ "ELN risk category",
+      npm1 ~ "NPM1 mutation",
+      flt3_itd ~ "FLT3-ITD",
+      DNMT3A ~ "DNMT3A mutation",
+      IDH1 ~ "IDH1 mutation",
+      IDH2 ~ "IDH2 mutation",
+      runx1 ~ "RUNX1 mutation",
+      asxl1 ~ "ASXL1 mutation",
+      tp53 ~ "TP53 mutation"
+    )
+  )
+
+tbl1
+```
+
+```{r export-excel}
+table_x <- as_tibble(tbl1, col_labels = TRUE)
+
+wb <- createWorkbook()
+addWorksheet(wb, "Baseline Characteristics")
+
+writeData(
+  wb,
+  sheet = "Baseline Characteristics",
+  x = table_x
+)
+
+saveWorkbook(
+  wb,
+  "Supplementary_Table_X_Baseline_Cohort_Characteristics.xlsx",
+  overwrite = TRUE
+)
+
+cat("Excel file written: Supplementary_Table_X_Baseline_Cohort_Characteristics.xlsx")
+```
